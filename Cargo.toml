@@ -6,8 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bytes = "1"
+rustix = "0.38"
 tokio = { version = "1", features = ['rt', 'net', 'io-util', 'sync'] }
 wayland-client = { version = "0.31" }
-wayland-server = { version = "0.31" }
-wayland-protocols = { version = "0.31", features = ['unstable', 'client', 'server'] }
-wayland-protocols-wlr = { version = "0.2", features = ['client', 'server'] }
+wayland-protocols = { version = "0.31", features = ['unstable', 'staging', 'client'] }
+wayland-protocols-wlr = { version = "0.2", features = ['client'] }
