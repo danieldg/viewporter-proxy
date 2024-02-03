@@ -40,6 +40,8 @@ struct ClientIO {
 #[derive(Debug)]
 struct State {
     dispatch_server: bool,
+    c_display: wayland_client::protocol::wl_display::WlDisplay,
+    c_qh: ClientQH,
     c_backend: wayland_client::backend::Backend,
     c_registry: wlc_registry::WlRegistry,
     s_handle: wayland_server::DisplayHandle,
@@ -206,6 +208,7 @@ impl wayland_client::backend::ObjectData for Proxied {
             .and_then(|f| f(&self.inner, handle, &mut msg));
         let sh = self.server.upgrade().unwrap();
         let sender_id = self.inner.lock().unwrap().server.clone();
+        dbg!(&msg);
         sh.send_event(wayland_server::backend::protocol::Message {
             opcode: msg.opcode,
             args: msg
@@ -298,78 +301,8 @@ impl DispatchClient<wlc_callback::WlCallback, Registry> for State {
         _: &Connection,
         _: &ClientQH,
     ) {
+        dbg!();
         state.dispatch_server = true;
-        let be = state.s_handle.backend_handle();
-        let oid_1 = be
-            .object_for_protocol_id(
-                state.s_client.id(),
-                &wayland_server::protocol::__interfaces::WL_DISPLAY_INTERFACE,
-                1,
-            )
-            .unwrap();
-        dbg!(&oid_1);
-        let data = be.get_object_data::<State>(oid_1.clone()).unwrap();
-        be.set_object_data::<State>(oid_1, Arc::new(ProxyDisplay(data)))
-            .unwrap();
-    }
-}
-
-struct ProxyDisplay(Arc<dyn wayland_server::backend::ObjectData<State>>);
-
-impl wayland_server::backend::ObjectData<State> for ProxyDisplay {
-    fn request(
-        self: Arc<Self>,
-        handle: &wayland_server::backend::Handle,
-        state: &mut State,
-        cid: wayland_server::backend::ClientId,
-        msg: wayland_server::backend::protocol::Message<wayland_server::backend::ObjectId, OwnedFd>,
-    ) -> Option<Arc<(dyn wayland_server::backend::ObjectData<State> + 'static)>> {
-        use wayland_client::backend::protocol::Argument as CArg;
-        use wayland_client::protocol::wl_display::*;
-        use wayland_server::backend::protocol::Argument as SArg;
-        dbg!(&msg);
-        match msg.opcode {
-            REQ_SYNC_OPCODE => {
-                let data = Proxied::new(
-                    None,
-                    None,
-                    handle,
-                    wayland_server::protocol::wl_callback::WlCallback::interface(),
-                );
-                let client_oid = state
-                    .c_backend
-                    .send_request(
-                        wayland_client::backend::protocol::Message {
-                            sender_id: state.c_backend.display_id(),
-                            opcode: msg.opcode,
-                            args: [CArg::NewId(wayland_client::backend::ObjectId::null())]
-                                .into_iter()
-                                .collect(),
-                        },
-                        Some(data.clone()),
-                        None,
-                    )
-                    .unwrap();
-                let mut lock = data.inner.lock().unwrap();
-                lock.client = client_oid;
-                lock.server = match &msg.args[0] {
-                    SArg::NewId(i) => i.clone(),
-                    _ => panic!(),
-                };
-                drop(lock);
-                Some(data)
-            }
-            REQ_GET_REGISTRY_OPCODE => self.0.clone().request(handle, state, cid, msg),
-            _ => unreachable!(),
-        }
-    }
-    fn destroyed(
-        self: Arc<Self>,
-        _: &wayland_server::backend::Handle,
-        _: &mut State,
-        _: wayland_server::backend::ClientId,
-        _: wayland_server::backend::ObjectId,
-    ) {
     }
 }
 
@@ -438,11 +371,15 @@ impl GlobalDispatch<wls_seat::WlSeat, ProxiedGlobal> for State {
         let data = Proxied::new(
             Some(|proxy, handle, state, msg| {
                 use wayland_server::protocol::wl_seat::*;
+                dbg!(&msg);
                 match msg.opcode {
                     _ => None,
                 }
             }),
-            Some(|proxy, handle, msg| None),
+            Some(|proxy, handle, msg| {
+                dbg!(msg);
+                None
+            }),
             &handle.backend_handle(),
             wayland_server::protocol::wl_seat::WlSeat::interface(),
         );
@@ -461,6 +398,11 @@ impl GlobalDispatch<wls_seat::WlSeat, ProxiedGlobal> for State {
         data.client = proxy.id();
         data.server = global.id();
         data.version = global.version();
+
+        // This is useless: dispatch_* will continue looping and will end up processing the
+        // incoming sync() before the passed-along constructor even gets sent.
+        state.dispatch_server = false;
+        let _ = state.c_display.sync(&state.c_qh, Registry);
     }
 }
 
@@ -482,6 +424,8 @@ async fn run(s_stream: UnixStream) -> Result<(), Box<dyn Error>> {
     let s_fd = AsyncFd::new(Fd(s_display.as_fd().as_raw_fd()))?;
     let mut state = State {
         dispatch_server: false,
+        c_display,
+        c_qh,
         c_backend,
         c_registry,
         s_handle,
@@ -510,13 +454,11 @@ async fn run(s_stream: UnixStream) -> Result<(), Box<dyn Error>> {
 
         let _ = c_queue.poll_dispatch_pending(cx, &mut state)?;
         if state.dispatch_server {
-            let ready = s_fd.poll_read_ready(cx)?;
-            if ready.is_ready() {
-                dbg!("server");
-            }
+            let s_ready = s_fd.poll_read_ready(cx)?;
+            dbg!(s_ready.is_ready());
             s_display.dispatch_clients(&mut state)?;
             s_display.flush_clients()?;
-            if let task::Poll::Ready(mut g) = ready {
+            if let task::Poll::Ready(mut g) = s_ready {
                 g.clear_ready();
             }
         }
