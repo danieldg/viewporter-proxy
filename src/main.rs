@@ -36,7 +36,11 @@ use wayland_protocols::{
 };
 
 fn scale_req_i32(x: i32) -> i32 {
-    x * 3 / 2
+    if x > i32::MAX / 3 {
+        x
+    } else {
+        x * 3 / 2
+    }
 }
 
 fn scale_req_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, F>) {
@@ -119,6 +123,7 @@ impl AsRawFd for Fd {
 #[derive(Debug)]
 struct Shared {
     server: AsyncFd<UnixStream>,
+    backend: wayland_client::backend::Backend,
     state: Mutex<State>,
 }
 
@@ -625,7 +630,24 @@ impl wayland_client::backend::ObjectData for Object {
         }
         created.map(|x| x as _)
     }
-    fn destroyed(&self, _: wayland_client::backend::ObjectId) {}
+
+    fn destroyed(&self, cid: wayland_client::backend::ObjectId) {
+        use wayland_client::backend::protocol::Argument as Arg;
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        debug_assert_eq!(self.client(), cid);
+        let sid = self.server();
+        if sid > 0 && sid < 0xff000000 {
+            shared.server_out_raw(1, wl_display::EVT_DELETE_ID_OPCODE, &[Arg::Uint(sid)]);
+        }
+        // Note: this function may be called from send_request if it sends a destructor
+        let mut state = shared.state.lock().unwrap();
+        state.sids.remove(&sid);
+        state.cids.remove(&cid);
+        state.surfaces.remove(&cid);
+        state.sizes.remove(&cid);
+    }
 }
 
 impl Shared {
@@ -791,10 +813,15 @@ impl Shared {
         }
 
         if send {
-            let oid = state
+            drop(state);
+            // Don't hold the lock while calling send_request
+
+            let oid = self
                 .backend
                 .send_request(msg, newid_data.clone().map(|x| x as _), child_spec)
                 .unwrap();
+
+            state = self.state.lock().unwrap();
             if let Some(obj) = newid_data {
                 *obj.client.lock().unwrap() = oid.clone();
                 state.cids.insert(oid, obj);
@@ -947,6 +974,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
 
     let shared = Arc::new_cyclic(|me| Shared {
         server,
+        backend: backend.clone(),
         state: Mutex::new(State {
             shared: me.clone(),
             sids: HashMap::new(),
@@ -973,7 +1001,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
                 if global.interface == "wp_viewporter" {
                     let viewporter =
                         Object::new_hidden(&shared, wp_viewporter::WpViewporter::interface());
-                    let viewporter_cid = state
+                    let viewporter_cid = shared
                         .backend
                         .send_request(
                             wayland_client::backend::protocol::Message {
