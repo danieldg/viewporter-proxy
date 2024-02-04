@@ -131,12 +131,13 @@ struct Shared {
 struct State {
     shared: Weak<Shared>,
     display: wl_display::WlDisplay,
+    _display_obj: Option<Arc<Object>>,
     backend: wayland_client::backend::Backend,
     globals: wayland_client::globals::GlobalList,
     viewporter: Option<Arc<Object>>,
     registries: Vec<Arc<Object>>,
-    sids: HashMap<u32, Arc<Object>>,
-    cids: HashMap<wayland_client::backend::ObjectId, Arc<Object>>,
+    sids: HashMap<u32, Weak<Object>>,
+    cids: HashMap<wayland_client::backend::ObjectId, Weak<Object>>,
     surfaces: HashMap<wayland_client::backend::ObjectId, SurfaceData>,
     sizes: HashMap<wayland_client::backend::ObjectId, (i32, i32)>,
 }
@@ -145,6 +146,15 @@ struct State {
 struct SurfaceData {
     scale: i32,
     viewport: Arc<Object>,
+}
+
+impl State {
+    fn cid(&self, cid: &wayland_client::backend::ObjectId) -> Option<Arc<Object>> {
+        self.cids.get(cid).and_then(Weak::upgrade)
+    }
+    fn sid(&self, sid: u32) -> Option<Arc<Object>> {
+        self.sids.get(&sid).and_then(Weak::upgrade)
+    }
 }
 
 #[derive(Debug)]
@@ -211,18 +221,24 @@ impl Object {
         })
     }
 
-    fn new_event_created(
-        shared: &Arc<Shared>,
-        id: wayland_client::backend::ObjectId,
-        server: u32,
-    ) -> Arc<Self> {
+    fn new_event_created(shared: &Arc<Shared>, id: wayland_client::backend::ObjectId) -> Arc<Self> {
+        // we don't currently support intercepting or generating server-created objects, so just
+        // enforce a 1:1 ID mapping for them.
         Arc::new(Object {
             shared: Arc::downgrade(shared),
-            server: AtomicU32::new(server),
+            server: AtomicU32::new(id.protocol_id()),
             hook: AtomicU32::new(HOOK_NONE),
             iface: id.interface(),
             client: Mutex::new(id),
         })
+    }
+
+    fn take_server(&self) -> u32 {
+        debug_assert!(self.client().is_null());
+        self.hook.store(HOOK_DEAD, Ordering::Relaxed);
+        let sid = self.server.load(Ordering::Relaxed);
+        self.server.store(0, Ordering::Relaxed);
+        sid
     }
 
     fn client(&self) -> wayland_client::backend::ObjectId {
@@ -318,7 +334,7 @@ impl Object {
                         Arg::Object(s) => state.surfaces.get(&s).unwrap(),
                         _ => panic!(),
                     };
-                    let new_sid = newid.take().unwrap().server();
+                    let new_sid = newid.take().unwrap().take_server();
                     surface.viewport.server.store(new_sid, Ordering::Relaxed);
                     *newid = Some(surface.viewport.clone());
                     return (false, None);
@@ -501,6 +517,7 @@ macro_rules! pseudo_enum {
 pseudo_enum! {
     enum Hooks {
         HOOK_NONE,
+        HOOK_DEAD,
         HOOK_REGISTRY,
         HOOK_COMPOSITOR,
         HOOK_SURFACE,
@@ -631,22 +648,41 @@ impl wayland_client::backend::ObjectData for Object {
         created.map(|x| x as _)
     }
 
-    fn destroyed(&self, cid: wayland_client::backend::ObjectId) {
+    fn destroyed(&self, _: wayland_client::backend::ObjectId) {
+        // Note: this function is called from send_request if it sends a destructor, not when the
+        // server actually calls delete_id.  It is therefore useless.
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
         use wayland_client::backend::protocol::Argument as Arg;
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        debug_assert_eq!(self.client(), cid);
-        let sid = self.server();
-        if sid > 0 && sid < 0xff000000 {
-            shared.server_out_raw(1, wl_display::EVT_DELETE_ID_OPCODE, &[Arg::Uint(sid)]);
+        let cid = self.client.get_mut().unwrap();
+        let sid = *self.server.get_mut();
+        if *self.hook.get_mut() == HOOK_DEAD {
+            debug_assert!(cid.is_null());
+            debug_assert_eq!(sid, 0);
+            return;
         }
-        // Note: this function may be called from send_request if it sends a destructor
-        let mut state = shared.state.lock().unwrap();
-        state.sids.remove(&sid);
+        let mut state = shared.state.try_lock().expect("Missing use of HOOK_DEAD");
         state.cids.remove(&cid);
         state.surfaces.remove(&cid);
         state.sizes.remove(&cid);
+        if let std::collections::hash_map::Entry::Occupied(e) = state.sids.entry(sid) {
+            if e.get().as_ptr() != self {
+                dbg!(sid); // early sid reuse or invalid object
+                return;
+            }
+            e.remove();
+            if sid < 0xff000000 {
+                shared.server_out_raw(1, wl_display::EVT_DELETE_ID_OPCODE, &[Arg::Uint(sid)]);
+            }
+        } else {
+            dbg!(sid);
+        }
     }
 }
 
@@ -715,7 +751,7 @@ impl Shared {
         let opcode = buf.get_u16_le();
         let _len = buf.get_u16_le();
         let mut state = self.state.lock().unwrap();
-        let Some(sender) = state.sids.get(&sender_sid).cloned() else {
+        let Some(sender) = state.sid(sender_sid) else {
             return;
         };
         let mut fd_count = 0;
@@ -751,8 +787,7 @@ impl Shared {
                     let sid = buf.get_u32_le();
                     Arg::Object(
                         state
-                            .sids
-                            .get(&sid)
+                            .sid(sid)
                             .map_or(wayland_client::backend::ObjectId::null(), |o| o.client()),
                     )
                 }
@@ -778,10 +813,11 @@ impl Shared {
         }
 
         if sender_sid == 1 && opcode == wl_display::REQ_GET_REGISTRY_OPCODE {
-            let obj = Object::new(self, state.globals.registry(), new_sid);
+            let obj = newid_data.unwrap();
+            *obj.client.lock().unwrap() = state.globals.registry().id();
             obj.hook.store(HOOK_REGISTRY, Ordering::Relaxed);
-            state.registries.push(obj.clone());
-            state.sids.insert(new_sid, obj);
+            state.sids.insert(new_sid, Arc::downgrade(&obj));
+            state.registries.push(obj);
             state.globals.contents().with_list(|list| {
                 for global in list {
                     self.send_global(new_sid, global.name, &global.interface, global.version);
@@ -809,7 +845,7 @@ impl Shared {
         let (send, post) = sender.intercept_request(&mut state, &mut msg, &mut newid_data);
 
         if let Some(obj) = &newid_data {
-            state.sids.insert(new_sid, obj.clone());
+            state.sids.insert(new_sid, Arc::downgrade(obj));
         }
 
         if send {
@@ -824,13 +860,14 @@ impl Shared {
             state = self.state.lock().unwrap();
             if let Some(obj) = newid_data {
                 *obj.client.lock().unwrap() = oid.clone();
-                state.cids.insert(oid, obj);
+                state.cids.insert(oid, Arc::downgrade(&obj));
             }
         }
 
         if let Some(post) = post {
             sender.intercept_request_post(&mut state, post);
         }
+        drop(state);
 
         fds.drain(..fd_count);
     }
@@ -884,15 +921,15 @@ impl Shared {
                 }
                 Arg::Object(cid) => {
                     let state = self.state.lock().unwrap();
-                    let sid = state.cids.get(cid).map_or(0, |obj| obj.server());
+                    let sid = state.cid(cid).map_or(0, |obj| obj.server());
                     buf.put_u32_le(sid);
                 }
                 Arg::NewId(cid) => {
                     let sid = cid.protocol_id();
                     let mut state = self.state.lock().unwrap();
-                    let obj = Object::new_event_created(self, cid.clone(), sid);
-                    state.cids.insert(cid.clone(), obj.clone());
-                    state.sids.insert(sid, obj.clone());
+                    let obj = Object::new_event_created(self, cid.clone());
+                    state.cids.insert(cid.clone(), Arc::downgrade(&obj));
+                    state.sids.insert(sid, Arc::downgrade(&obj));
                     rv = Some(obj);
                     buf.put_u32_le(sid);
                 }
@@ -983,6 +1020,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
             sizes: HashMap::new(),
             viewporter: None,
             display,
+            _display_obj: None,
             backend,
             globals,
             registries: Vec::new(),
@@ -993,8 +1031,9 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
         use wayland_client::backend::protocol::Argument as Arg;
 
         let obj = Object::new(&shared, &state.display, 1);
-        state.sids.insert(1, obj.clone());
-        state.cids.insert(state.display.id(), obj);
+        state.sids.insert(1, Arc::downgrade(&obj));
+        state.cids.insert(state.display.id(), Arc::downgrade(&obj));
+        state._display_obj = Some(obj); // prevent delete_id of the display
 
         state.globals.contents().with_list(|list| {
             for global in list {
@@ -1024,6 +1063,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
                         .unwrap();
                     *viewporter.client.lock().unwrap() = viewporter_cid;
                     state.viewporter = Some(viewporter);
+                    break;
                 }
             }
         });
