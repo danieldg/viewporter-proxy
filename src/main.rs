@@ -15,8 +15,8 @@ use std::{
 };
 use tokio::io::unix::AsyncFd;
 use wayland_client::protocol::{
-    wl_compositor, wl_data_device_manager, wl_display, wl_output, wl_pointer, wl_registry, wl_seat,
-    wl_shm, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
+    wl_compositor, wl_data_device, wl_data_device_manager, wl_display, wl_output, wl_pointer,
+    wl_registry, wl_seat, wl_shm, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
 };
 use wayland_client::{Connection, Dispatch, Proxy};
 use wayland_protocols::{
@@ -32,7 +32,7 @@ use wayland_protocols::{
     },
     xdg::activation::v1::client::xdg_activation_v1,
     xdg::decoration::zv1::client::zxdg_decoration_manager_v1,
-    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+    xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 
 fn scale_req_i32(x: i32) -> i32 {
@@ -44,6 +44,7 @@ fn scale_req_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, 
     match arg {
         Arg::Int(x) => *x = scale_req_i32(*x),
         Arg::Uint(x) => *x = (*x * 3) / 2,
+        Arg::Fixed(x) => *x = (*x * 3) / 2,
         _ => panic!(),
     }
 }
@@ -84,15 +85,16 @@ fn lookup_interface(name: &[u8]) -> Option<&'static wayland_client::backend::pro
         b"xdg_wm_base" => xdg_wm_base::XdgWmBase::interface(),
         //  b"zwp_idle_inhibit_manager_v1"
         b"zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1::interface(),
-        //  b"zwp_pointer_constraints_v1"
+        //  b"zwp_pointer_constraints_v1" - set_cursor_position_hint
         //  b"zwp_pointer_gestures_v1"
         b"zwp_primary_selection_device_manager_v1" => {
             zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1::interface()
         }
-        //  b"zwp_relative_pointer_manager_v1" (must scale)
-        //  b"zwp_tablet_manager_v2" (must scale)
+        //  b"zwp_relative_pointer_manager_v1" - motion events
+        //  b"zwp_tablet_manager_v2" - scale tool positions
         b"zwp_text_input_manager_v3" => {
             zwp_text_input_manager_v3::ZwpTextInputManagerV3::interface()
+            // TODO set_cursor_rectangle
         }
         b"zxdg_decoration_manager_v1" => {
             zxdg_decoration_manager_v1::ZxdgDecorationManagerV1::interface()
@@ -101,7 +103,6 @@ fn lookup_interface(name: &[u8]) -> Option<&'static wayland_client::backend::pro
         //  b"zxdg_exporter_v2"
         //  b"zxdg_importer_v1"
         //  b"zxdg_importer_v2"
-        //  b"zxdg_output_manager_v1"
         _ => return None,
     })
 }
@@ -137,6 +138,7 @@ struct State {
 
 #[derive(Debug)]
 struct SurfaceData {
+    scale: i32,
     viewport: Arc<Object>,
 }
 
@@ -175,6 +177,8 @@ impl Object {
         let rv = Self::new_request_created(shared, server, iface);
         let hook = match iface.name {
             "wl_compositor" => HOOK_COMPOSITOR,
+            "wl_data_device_manager" => HOOK_DATA_DEVICE_MGR,
+            "wl_output" => HOOK_OUTPUT,
             "wl_seat" => HOOK_SEAT,
             "wl_shm" => HOOK_SHM_GLOBAL,
             "wl_subcompositor" => HOOK_SUBCOMPOSITOR,
@@ -243,31 +247,31 @@ impl Object {
         match self.hook.load(Ordering::Relaxed) {
             HOOK_NONE => {}
             HOOK_REGISTRY => {}
-            HOOK_COMPOSITOR => {
-                if msg.opcode == wl_compositor::REQ_CREATE_SURFACE_OPCODE {
+            HOOK_COMPOSITOR => match msg.opcode {
+                wl_compositor::REQ_CREATE_SURFACE_OPCODE => {
                     hook_newid(newid, HOOK_SURFACE);
                     return (true, newid.clone().map(|s| (s, None)));
                 }
-            }
-            HOOK_SURFACE => {
-                if msg.opcode == wl_surface::REQ_ATTACH_OPCODE {
-                    let viewport = state
-                        .surfaces
-                        .get(&self.client())
-                        .unwrap()
-                        .viewport
-                        .client();
+                wl_compositor::REQ_CREATE_REGION_OPCODE => hook_newid(newid, HOOK_REGION),
+                _ => {}
+            },
+            HOOK_SURFACE => match msg.opcode {
+                wl_surface::REQ_ATTACH_OPCODE => {
+                    let sd = state.surfaces.get(&self.client()).unwrap();
+                    let viewport = sd.viewport.client();
+                    let scale = sd.scale;
                     let vp_size = state.sizes.get(&viewport);
 
                     if !vp_size.is_some_and(|&(x, _)| x >= 0) {
                         // buffer size changes don't matter if the viewport is being used
                         let size = match &msg.args[0] {
-                            Arg::Object(s) => state.sizes.get(s),
+                            Arg::Object(buffer) => state.sizes.get(buffer),
                             _ => panic!(),
                         };
-                        let (x, y) = size
-                            .cloned()
-                            .map_or((-1, -1), |(x, y)| (scale_req_i32(x), scale_req_i32(y)));
+                        // buffer size is reduced by the declared scale
+                        let (x, y) = size.cloned().map_or((-1, -1), |(x, y)| {
+                            (scale_req_i32(x / scale), scale_req_i32(y / scale))
+                        });
                         state
                             .backend
                             .send_request(
@@ -282,7 +286,19 @@ impl Object {
                             .unwrap();
                     }
                 }
-                // TODO regions need munging
+                wl_surface::REQ_SET_BUFFER_SCALE_OPCODE => {
+                    let scale = match &msg.args[0] {
+                        Arg::Int(i) => *i,
+                        _ => panic!(),
+                    };
+                    state.surfaces.get_mut(&self.client()).unwrap().scale = scale;
+                }
+                _ => {}
+            },
+            HOOK_REGION => {
+                for arg in &mut msg.args {
+                    scale_req_arg(arg);
+                }
             }
             HOOK_SUBCOMPOSITOR => hook_newid(newid, HOOK_SUBSURFACE),
             HOOK_SUBSURFACE => {
@@ -350,17 +366,14 @@ impl Object {
                 }
             }
             HOOK_BUFFER => {}
-            HOOK_XDG_WM => {
-                if msg.opcode == xdg_wm_base::REQ_GET_XDG_SURFACE_OPCODE {
-                    if let Some(id) = newid {
-                        id.hook.store(HOOK_XDG_SURFACE, Ordering::Relaxed);
-                    }
-                }
-                // TODO positioners need all the munging
-            }
+            HOOK_XDG_WM => match msg.opcode {
+                xdg_wm_base::REQ_GET_XDG_SURFACE_OPCODE => hook_newid(newid, HOOK_XDG_SURFACE),
+                xdg_wm_base::REQ_CREATE_POSITIONER_OPCODE => hook_newid(newid, HOOK_XDG_POSITIONER),
+                _ => {}
+            },
             HOOK_XDG_SURFACE => match msg.opcode {
                 xdg_surface::REQ_GET_TOPLEVEL_OPCODE => hook_newid(newid, HOOK_XDG_TOPLEVEL),
-                // TODO popup needs configure munging
+                xdg_surface::REQ_GET_POPUP_OPCODE => hook_newid(newid, HOOK_XDG_POPUP),
                 xdg_surface::REQ_SET_WINDOW_GEOMETRY_OPCODE => {
                     for arg in &mut msg.args {
                         scale_req_arg(arg);
@@ -368,7 +381,19 @@ impl Object {
                 }
                 _ => {}
             },
+            HOOK_XDG_POSITIONER => match msg.opcode {
+                xdg_positioner::REQ_SET_SIZE_OPCODE
+                | xdg_positioner::REQ_SET_ANCHOR_RECT_OPCODE
+                | xdg_positioner::REQ_SET_OFFSET_OPCODE
+                | xdg_positioner::REQ_SET_PARENT_SIZE_OPCODE => {
+                    for arg in &mut msg.args {
+                        scale_req_arg(arg);
+                    }
+                }
+                _ => {}
+            },
             HOOK_XDG_TOPLEVEL => {}
+            HOOK_XDG_POPUP => {}
             HOOK_DMABUF_GLOBAL => {
                 if msg.opcode == zwp_linux_dmabuf_v1::REQ_CREATE_PARAMS_OPCODE {
                     hook_newid(newid, HOOK_DMABUF_PARAMS);
@@ -397,8 +422,16 @@ impl Object {
                 wl_seat::REQ_GET_TOUCH_OPCODE => hook_newid(newid, HOOK_TOUCH),
                 _ => {}
             },
+            HOOK_OUTPUT => {}
             HOOK_POINTER => {}
             HOOK_TOUCH => {}
+            HOOK_DATA_DEVICE_MGR => match msg.opcode {
+                wl_data_device_manager::REQ_GET_DATA_DEVICE_OPCODE => {
+                    hook_newid(newid, HOOK_DATA_DEVICE)
+                }
+                _ => {}
+            },
+            HOOK_DATA_DEVICE => {}
             _ => unreachable!(),
         }
         (true, None)
@@ -437,7 +470,9 @@ impl Object {
 
                 *viewport.client.lock().unwrap() = viewport_cid;
 
-                state.surfaces.insert(surface_cid, SurfaceData { viewport });
+                state
+                    .surfaces
+                    .insert(surface_cid, SurfaceData { scale: 1, viewport });
             }
             (buffer, Some((x, y))) => {
                 state.sizes.insert(buffer.client(), (x, y));
@@ -446,27 +481,49 @@ impl Object {
     }
 }
 
-const HOOK_NONE: u32 = 0;
-const HOOK_REGISTRY: u32 = 1;
-const HOOK_COMPOSITOR: u32 = 2;
-const HOOK_SURFACE: u32 = 3;
-const HOOK_VIEWPORTER: u32 = 4;
-const HOOK_VIEWPORT: u32 = 5;
-const HOOK_SHM_GLOBAL: u32 = 6;
-const HOOK_SHM_POOL: u32 = 7;
-const HOOK_BUFFER: u32 = 8;
-const HOOK_XDG_WM: u32 = 9;
-const HOOK_XDG_SURFACE: u32 = 10;
-const HOOK_XDG_TOPLEVEL: u32 = 11;
-const HOOK_DMABUF_GLOBAL: u32 = 12;
-const HOOK_DMABUF_PARAMS: u32 = 13;
-const HOOK_SEAT: u32 = 14;
-const HOOK_POINTER: u32 = 15;
-const HOOK_TOUCH: u32 = 16;
-const HOOK_SUBCOMPOSITOR: u32 = 17;
-const HOOK_SUBSURFACE: u32 = 18;
-const HOOK_FSM: u32 = 19;
-const HOOK_FSCALE: u32 = 20;
+macro_rules! pseudo_enum {
+    (enum $name:ident { $($x:ident),* $(,)? }) => {
+        #[allow(non_camel_case_types)]
+        enum Hooks {
+            $($x,)*
+        }
+        $(
+            const $x: u32 = Hooks::$x as u32;
+        )*
+    };
+}
+
+pseudo_enum! {
+    enum Hooks {
+        HOOK_NONE,
+        HOOK_REGISTRY,
+        HOOK_COMPOSITOR,
+        HOOK_SURFACE,
+        HOOK_REGION,
+        HOOK_SUBCOMPOSITOR,
+        HOOK_SUBSURFACE,
+        HOOK_VIEWPORTER,
+        HOOK_VIEWPORT,
+        HOOK_SHM_GLOBAL,
+        HOOK_SHM_POOL,
+        HOOK_BUFFER,
+        HOOK_XDG_WM,
+        HOOK_XDG_POSITIONER,
+        HOOK_XDG_SURFACE,
+        HOOK_XDG_TOPLEVEL,
+        HOOK_XDG_POPUP,
+        HOOK_DMABUF_GLOBAL,
+        HOOK_DMABUF_PARAMS,
+        HOOK_SEAT,
+        HOOK_POINTER,
+        HOOK_TOUCH,
+        HOOK_FSM,
+        HOOK_FSCALE,
+        HOOK_OUTPUT,
+        HOOK_DATA_DEVICE_MGR,
+        HOOK_DATA_DEVICE,
+    }
+}
 
 impl wayland_client::backend::ObjectData for Object {
     fn event(
@@ -481,7 +538,6 @@ impl wayland_client::backend::ObjectData for Object {
         let sid = self.server();
         match self.hook.load(Ordering::Relaxed) {
             HOOK_NONE => {}
-            HOOK_REGISTRY => unreachable!(), // registry events are sent via Dispatch
             HOOK_SURFACE => {}
             HOOK_SHM_GLOBAL => {}
             HOOK_BUFFER => {}
@@ -494,8 +550,23 @@ impl wayland_client::backend::ObjectData for Object {
                 }
                 _ => {}
             },
+            HOOK_XDG_POPUP => match msg.opcode {
+                xdg_popup::EVT_CONFIGURE_OPCODE => {
+                    scale_evt_arg(&mut msg.args[0]);
+                    scale_evt_arg(&mut msg.args[1]);
+                    scale_evt_arg(&mut msg.args[2]);
+                    scale_evt_arg(&mut msg.args[3]);
+                }
+                _ => {}
+            },
             HOOK_DMABUF_GLOBAL => {}
             HOOK_DMABUF_PARAMS => {}
+            HOOK_OUTPUT => match msg.opcode {
+                wl_output::EVT_SCALE_OPCODE => {
+                    msg.args[0] = wayland_client::backend::protocol::Argument::Int(2);
+                }
+                _ => {}
+            },
             HOOK_SEAT => {}
             HOOK_POINTER => match msg.opcode {
                 wl_pointer::EVT_ENTER_OPCODE => {
@@ -527,6 +598,17 @@ impl wayland_client::backend::ObjectData for Object {
                 // This one is backwards: scale goes up as the multiplier increases
                 scale_req_arg(&mut msg.args[0]);
             }
+            HOOK_DATA_DEVICE => match msg.opcode {
+                wl_data_device::EVT_ENTER_OPCODE => {
+                    scale_req_arg(&mut msg.args[2]);
+                    scale_req_arg(&mut msg.args[3]);
+                }
+                wl_data_device::EVT_MOTION_OPCODE => {
+                    scale_req_arg(&mut msg.args[1]);
+                    scale_req_arg(&mut msg.args[2]);
+                }
+                _ => {}
+            },
             _ => unreachable!(),
         }
 
