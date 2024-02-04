@@ -14,39 +14,89 @@ use std::{
     task,
 };
 use tokio::io::unix::AsyncFd;
-use wayland_client::protocol::{wl_compositor, wl_display, wl_registry, wl_surface};
+use wayland_client::protocol::{
+    wl_compositor, wl_data_device_manager, wl_display, wl_output, wl_pointer, wl_registry, wl_seat,
+    wl_shm, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
+};
 use wayland_client::{Connection, Dispatch, Proxy};
-use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::{
+    wp::{
+        cursor_shape::v1::client::wp_cursor_shape_manager_v1,
+        fractional_scale::v1::client::wp_fractional_scale_manager_v1,
+        linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1},
+        presentation_time::client::wp_presentation,
+        primary_selection::zv1::client::zwp_primary_selection_device_manager_v1,
+        single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1,
+        text_input::zv3::client::zwp_text_input_manager_v3,
+        viewporter::client::{wp_viewport, wp_viewporter},
+    },
+    xdg::activation::v1::client::xdg_activation_v1,
+    xdg::decoration::zv1::client::zxdg_decoration_manager_v1,
+    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+};
+
+fn scale_req_i32(x: i32) -> i32 {
+    x * 3 / 2
+}
+
+fn scale_req_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, F>) {
+    use wayland_client::backend::protocol::Argument as Arg;
+    match arg {
+        Arg::Int(x) => *x = scale_req_i32(*x),
+        Arg::Uint(x) => *x = (*x * 3) / 2,
+        _ => panic!(),
+    }
+}
+
+fn scale_evt_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, F>) {
+    use wayland_client::backend::protocol::Argument as Arg;
+    match arg {
+        Arg::Int(i) => *i = (*i * 2 + 1) / 3,
+        Arg::Uint(i) => *i = (*i * 2 + 1) / 3,
+        Arg::Fixed(i) => *i = (*i * 2 + 1) / 3,
+        _ => unreachable!(),
+    }
+}
 
 fn lookup_interface(name: &[u8]) -> Option<&'static wayland_client::backend::protocol::Interface> {
     Some(match name {
         //  b"ext_idle_notifier_v1"
         //  b"org_kde_kwin_server_decoration_manager"
         b"wl_compositor" => wl_compositor::WlCompositor::interface(),
-        b"wl_data_device_manager" => wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager::interface(),
-        b"wl_output" => wayland_client::protocol::wl_output::WlOutput::interface(),
-        b"wl_seat" => wayland_client::protocol::wl_seat::WlSeat::interface(),
-        b"wl_shm" => wayland_client::protocol::wl_shm::WlShm::interface(),
-        b"wl_subcompositor" => wayland_client::protocol::wl_subcompositor::WlSubcompositor::interface(),
+        b"wl_data_device_manager" => wl_data_device_manager::WlDataDeviceManager::interface(),
+        b"wl_output" => wl_output::WlOutput::interface(),
+        b"wl_seat" => wl_seat::WlSeat::interface(),
+        b"wl_shm" => wl_shm::WlShm::interface(),
+        b"wl_subcompositor" => wl_subcompositor::WlSubcompositor::interface(),
         //  b"wp_content_type_manager_v1"
-        //  b"wp_cursor_shape_manager_v1"
-        //  b"wp_drm_lease_device_v1"
-        b"wp_fractional_scale_manager_v1" => wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1::interface(),
-        b"wp_presentation" => wayland_protocols::wp::presentation_time::client::wp_presentation::WpPresentation::interface(),
-        //  b"wp_security_context_manager_v1"
-        //  b"wp_single_pixel_buffer_manager_v1"
+        b"wp_cursor_shape_manager_v1" => {
+            wp_cursor_shape_manager_v1::WpCursorShapeManagerV1::interface()
+        }
+        b"wp_fractional_scale_manager_v1" => {
+            wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1::interface()
+        }
+        b"wp_presentation" => wp_presentation::WpPresentation::interface(),
+        b"wp_single_pixel_buffer_manager_v1" => {
+            wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1::interface()
+        }
         b"wp_viewporter" => wp_viewporter::WpViewporter::interface(),
-        //  b"xdg_activation_v1"
-        b"xdg_wm_base" => wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase::interface(),
+        b"xdg_activation_v1" => xdg_activation_v1::XdgActivationV1::interface(),
+        b"xdg_wm_base" => xdg_wm_base::XdgWmBase::interface(),
         //  b"zwp_idle_inhibit_manager_v1"
-        //  b"zwp_linux_dmabuf_v1"
+        b"zwp_linux_dmabuf_v1" => zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1::interface(),
         //  b"zwp_pointer_constraints_v1"
         //  b"zwp_pointer_gestures_v1"
-        //  b"zwp_primary_selection_device_manager_v1"
-        //  b"zwp_relative_pointer_manager_v1"
-        //  b"zwp_tablet_manager_v2"
-        //  b"zwp_text_input_manager_v3"
-        //  b"zxdg_decoration_manager_v1"
+        b"zwp_primary_selection_device_manager_v1" => {
+            zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1::interface()
+        }
+        //  b"zwp_relative_pointer_manager_v1" (must scale)
+        //  b"zwp_tablet_manager_v2" (must scale)
+        b"zwp_text_input_manager_v3" => {
+            zwp_text_input_manager_v3::ZwpTextInputManagerV3::interface()
+        }
+        b"zxdg_decoration_manager_v1" => {
+            zxdg_decoration_manager_v1::ZxdgDecorationManagerV1::interface()
+        }
         //  b"zxdg_exporter_v1"
         //  b"zxdg_exporter_v2"
         //  b"zxdg_importer_v1"
@@ -55,8 +105,6 @@ fn lookup_interface(name: &[u8]) -> Option<&'static wayland_client::backend::pro
         _ => return None,
     })
 }
-
-const SCALE: i32 = 2;
 
 #[derive(Debug)]
 struct Fd(i32);
@@ -84,12 +132,11 @@ struct State {
     sids: HashMap<u32, Arc<Object>>,
     cids: HashMap<wayland_client::backend::ObjectId, Arc<Object>>,
     surfaces: HashMap<wayland_client::backend::ObjectId, SurfaceData>,
-    buffers: HashMap<wayland_client::backend::ObjectId, (i32, i32)>,
+    sizes: HashMap<wayland_client::backend::ObjectId, (i32, i32)>,
 }
 
 #[derive(Debug)]
 struct SurfaceData {
-    surface: Arc<Object>,
     viewport: Arc<Object>,
 }
 
@@ -127,9 +174,14 @@ impl Object {
     ) -> Arc<Self> {
         let rv = Self::new_request_created(shared, server, iface);
         let hook = match iface.name {
-            "wl_compositor" => dbg!(HOOK_COMPOSITOR),
-            "wp_viewporter" => dbg!(HOOK_VIEWPORTER),
-            "wl_shm" => dbg!(HOOK_SHM_GLOBAL),
+            "wl_compositor" => HOOK_COMPOSITOR,
+            "wl_seat" => HOOK_SEAT,
+            "wl_shm" => HOOK_SHM_GLOBAL,
+            "wl_subcompositor" => HOOK_SUBCOMPOSITOR,
+            "wp_fractional_scale_manager_v1" => HOOK_FSM,
+            "wp_viewporter" => HOOK_VIEWPORTER,
+            "xdg_wm_base" => HOOK_XDG_WM,
+            "zwp_linux_dmabuf_v1" => HOOK_DMABUF_GLOBAL,
             _ => return rv,
         };
         rv.hook.store(hook, Ordering::Relaxed);
@@ -182,45 +234,61 @@ impl Object {
         newid: &mut Option<Arc<Object>>,
     ) -> (bool, Option<(Arc<Object>, Option<(i32, i32)>)>) {
         use wayland_client::backend::protocol::Argument as Arg;
+        fn hook_newid(newid: &mut Option<Arc<Object>>, hook: u32) {
+            if let Some(id) = newid {
+                id.hook.store(hook, Ordering::Relaxed);
+            }
+        }
 
         match self.hook.load(Ordering::Relaxed) {
             HOOK_NONE => {}
             HOOK_REGISTRY => {}
             HOOK_COMPOSITOR => {
                 if msg.opcode == wl_compositor::REQ_CREATE_SURFACE_OPCODE {
-                    newid
-                        .as_ref()
-                        .unwrap()
-                        .hook
-                        .store(HOOK_SURFACE, Ordering::Relaxed);
+                    hook_newid(newid, HOOK_SURFACE);
                     return (true, newid.clone().map(|s| (s, None)));
                 }
             }
             HOOK_SURFACE => {
                 if msg.opcode == wl_surface::REQ_ATTACH_OPCODE {
-                    let surface = state.surfaces.get(&self.client()).unwrap();
-                    let buffer = match &msg.args[0] {
-                        Arg::Object(s) => state.buffers.get(s),
-                        _ => panic!(),
-                    };
+                    let viewport = state
+                        .surfaces
+                        .get(&self.client())
+                        .unwrap()
+                        .viewport
+                        .client();
+                    let vp_size = state.sizes.get(&viewport);
 
-                    let (x, y) = buffer.cloned().unwrap_or((-1, -1));
-
-                    let x = x * SCALE;
-                    let y = y * SCALE;
-
-                    state
-                        .backend
-                        .send_request(
-                            wayland_client::backend::protocol::Message {
-                                sender_id: surface.viewport.client(),
-                                opcode: wp_viewport::REQ_SET_DESTINATION_OPCODE,
-                                args: [Arg::Int(x), Arg::Int(y)].into_iter().collect(),
-                            },
-                            None,
-                            None,
-                        )
-                        .unwrap();
+                    if !vp_size.is_some_and(|&(x, _)| x >= 0) {
+                        // buffer size changes don't matter if the viewport is being used
+                        let size = match &msg.args[0] {
+                            Arg::Object(s) => state.sizes.get(s),
+                            _ => panic!(),
+                        };
+                        let (x, y) = size
+                            .cloned()
+                            .map_or((-1, -1), |(x, y)| (scale_req_i32(x), scale_req_i32(y)));
+                        state
+                            .backend
+                            .send_request(
+                                wayland_client::backend::protocol::Message {
+                                    sender_id: viewport,
+                                    opcode: wp_viewport::REQ_SET_DESTINATION_OPCODE,
+                                    args: [Arg::Int(x), Arg::Int(y)].into_iter().collect(),
+                                },
+                                None,
+                                None,
+                            )
+                            .unwrap();
+                    }
+                }
+                // TODO regions need munging
+            }
+            HOOK_SUBCOMPOSITOR => hook_newid(newid, HOOK_SUBSURFACE),
+            HOOK_SUBSURFACE => {
+                if msg.opcode == wl_subsurface::REQ_SET_POSITION_OPCODE {
+                    scale_req_arg(&mut msg.args[0]);
+                    scale_req_arg(&mut msg.args[1]);
                 }
             }
             HOOK_VIEWPORTER => {
@@ -235,8 +303,8 @@ impl Object {
                     return (false, None);
                 }
             }
-            HOOK_VIEWPORT => {
-                if msg.opcode == wp_viewport::REQ_DESTROY_OPCODE {
+            HOOK_VIEWPORT => match msg.opcode {
+                wp_viewport::REQ_DESTROY_OPCODE => {
                     self.server.store(0, Ordering::Relaxed);
 
                     msg.opcode = wp_viewport::REQ_SET_SOURCE_OPCODE;
@@ -249,15 +317,28 @@ impl Object {
                     .into_iter()
                     .collect();
 
-                    // TODO may also need to fix destination
+                    state.sizes.remove(&self.client());
                     return (true, None);
                 }
-            }
-            HOOK_SHM_GLOBAL => {
-                if let Some(id) = newid {
-                    id.hook.store(HOOK_SHM_POOL, Ordering::Relaxed);
+                wp_viewport::REQ_SET_DESTINATION_OPCODE => {
+                    let args = msg.args.split_first_mut().unwrap();
+                    let size = match (args.0, &mut args.1[0]) {
+                        (Arg::Int(x), Arg::Int(y)) => {
+                            if *x > 0 {
+                                *x = scale_req_i32(*x);
+                                *y = scale_req_i32(*y);
+                            }
+                            (*x, *y)
+                        }
+                        _ => panic!(),
+                    };
+                    state.sizes.insert(self.client(), size);
                 }
-            }
+                _ => {}
+            },
+            HOOK_FSM => hook_newid(newid, HOOK_FSCALE),
+            HOOK_FSCALE => {}
+            HOOK_SHM_GLOBAL => hook_newid(newid, HOOK_SHM_POOL),
             HOOK_SHM_POOL => {
                 if let Some(id) = newid {
                     id.hook.store(HOOK_BUFFER, Ordering::Relaxed);
@@ -269,6 +350,55 @@ impl Object {
                 }
             }
             HOOK_BUFFER => {}
+            HOOK_XDG_WM => {
+                if msg.opcode == xdg_wm_base::REQ_GET_XDG_SURFACE_OPCODE {
+                    if let Some(id) = newid {
+                        id.hook.store(HOOK_XDG_SURFACE, Ordering::Relaxed);
+                    }
+                }
+                // TODO positioners need all the munging
+            }
+            HOOK_XDG_SURFACE => match msg.opcode {
+                xdg_surface::REQ_GET_TOPLEVEL_OPCODE => hook_newid(newid, HOOK_XDG_TOPLEVEL),
+                // TODO popup needs configure munging
+                xdg_surface::REQ_SET_WINDOW_GEOMETRY_OPCODE => {
+                    for arg in &mut msg.args {
+                        scale_req_arg(arg);
+                    }
+                }
+                _ => {}
+            },
+            HOOK_XDG_TOPLEVEL => {}
+            HOOK_DMABUF_GLOBAL => {
+                if msg.opcode == zwp_linux_dmabuf_v1::REQ_CREATE_PARAMS_OPCODE {
+                    hook_newid(newid, HOOK_DMABUF_PARAMS);
+                }
+            }
+            HOOK_DMABUF_PARAMS => {
+                if msg.opcode == zwp_linux_buffer_params_v1::REQ_CREATE_IMMED_OPCODE {
+                    if let Some(id) = newid {
+                        id.hook.store(HOOK_BUFFER, Ordering::Relaxed);
+                        let size = match (&msg.args[1], &msg.args[2]) {
+                            (Arg::Int(x), Arg::Int(y)) => (*x, *y),
+                            _ => panic!(),
+                        };
+                        return (true, Some((id.clone(), Some(size))));
+                    }
+                } else if msg.opcode == zwp_linux_buffer_params_v1::REQ_CREATE_OPCODE {
+                    let size = match (&msg.args[0], &msg.args[1]) {
+                        (Arg::Int(x), Arg::Int(y)) => (*x, *y),
+                        _ => panic!(),
+                    };
+                    state.sizes.insert(self.client(), size);
+                }
+            }
+            HOOK_SEAT => match msg.opcode {
+                wl_seat::REQ_GET_POINTER_OPCODE => hook_newid(newid, HOOK_POINTER),
+                wl_seat::REQ_GET_TOUCH_OPCODE => hook_newid(newid, HOOK_TOUCH),
+                _ => {}
+            },
+            HOOK_POINTER => {}
+            HOOK_TOUCH => {}
             _ => unreachable!(),
         }
         (true, None)
@@ -307,12 +437,10 @@ impl Object {
 
                 *viewport.client.lock().unwrap() = viewport_cid;
 
-                state
-                    .surfaces
-                    .insert(surface_cid, SurfaceData { surface, viewport });
+                state.surfaces.insert(surface_cid, SurfaceData { viewport });
             }
             (buffer, Some((x, y))) => {
-                state.buffers.insert(buffer.client(), (x, y));
+                state.sizes.insert(buffer.client(), (x, y));
             }
         }
     }
@@ -327,12 +455,27 @@ const HOOK_VIEWPORT: u32 = 5;
 const HOOK_SHM_GLOBAL: u32 = 6;
 const HOOK_SHM_POOL: u32 = 7;
 const HOOK_BUFFER: u32 = 8;
+const HOOK_XDG_WM: u32 = 9;
+const HOOK_XDG_SURFACE: u32 = 10;
+const HOOK_XDG_TOPLEVEL: u32 = 11;
+const HOOK_DMABUF_GLOBAL: u32 = 12;
+const HOOK_DMABUF_PARAMS: u32 = 13;
+const HOOK_SEAT: u32 = 14;
+const HOOK_POINTER: u32 = 15;
+const HOOK_TOUCH: u32 = 16;
+const HOOK_SUBCOMPOSITOR: u32 = 17;
+const HOOK_SUBSURFACE: u32 = 18;
+const HOOK_FSM: u32 = 19;
+const HOOK_FSCALE: u32 = 20;
 
 impl wayland_client::backend::ObjectData for Object {
     fn event(
         self: Arc<Self>,
         _: &wayland_client::backend::Backend,
-        msg: wayland_client::backend::protocol::Message<wayland_client::backend::ObjectId, OwnedFd>,
+        mut msg: wayland_client::backend::protocol::Message<
+            wayland_client::backend::ObjectId,
+            OwnedFd,
+        >,
     ) -> Option<Arc<(dyn wayland_client::backend::ObjectData + 'static)>> {
         let shared = self.shared.upgrade()?;
         let sid = self.server();
@@ -342,11 +485,63 @@ impl wayland_client::backend::ObjectData for Object {
             HOOK_SURFACE => {}
             HOOK_SHM_GLOBAL => {}
             HOOK_BUFFER => {}
+            HOOK_XDG_WM => {}
+            HOOK_XDG_SURFACE => {}
+            HOOK_XDG_TOPLEVEL => match msg.opcode {
+                xdg_toplevel::EVT_CONFIGURE_OPCODE | xdg_toplevel::EVT_CONFIGURE_BOUNDS_OPCODE => {
+                    scale_evt_arg(&mut msg.args[0]);
+                    scale_evt_arg(&mut msg.args[1]);
+                }
+                _ => {}
+            },
+            HOOK_DMABUF_GLOBAL => {}
+            HOOK_DMABUF_PARAMS => {}
+            HOOK_SEAT => {}
+            HOOK_POINTER => match msg.opcode {
+                wl_pointer::EVT_ENTER_OPCODE => {
+                    scale_evt_arg(&mut msg.args[2]);
+                    scale_evt_arg(&mut msg.args[3]);
+                }
+                wl_pointer::EVT_MOTION_OPCODE => {
+                    scale_evt_arg(&mut msg.args[1]);
+                    scale_evt_arg(&mut msg.args[2]);
+                }
+                _ => {}
+            },
+            HOOK_TOUCH => match msg.opcode {
+                wl_touch::EVT_DOWN_OPCODE => {
+                    scale_evt_arg(&mut msg.args[4]);
+                    scale_evt_arg(&mut msg.args[5]);
+                }
+                wl_touch::EVT_MOTION_OPCODE => {
+                    scale_evt_arg(&mut msg.args[2]);
+                    scale_evt_arg(&mut msg.args[3]);
+                }
+                wl_touch::EVT_SHAPE_OPCODE => {
+                    scale_evt_arg(&mut msg.args[1]);
+                    scale_evt_arg(&mut msg.args[2]);
+                }
+                _ => {}
+            },
+            HOOK_FSCALE => {
+                // This one is backwards: scale goes up as the multiplier increases
+                scale_req_arg(&mut msg.args[0]);
+            }
             _ => unreachable!(),
         }
-        shared
-            .server_out_raw(sid, msg.opcode, &msg.args)
-            .map(|x| x as _)
+
+        let created = shared.server_out_raw(sid, msg.opcode, &msg.args);
+        if let Some(created) = &created {
+            if self.hook.load(Ordering::Relaxed) == HOOK_DMABUF_PARAMS
+                && msg.opcode == zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE
+            {
+                let shared = self.shared.upgrade().unwrap();
+                let mut state = shared.state.lock().unwrap();
+                let size = state.sizes.remove(&self.client()).unwrap();
+                state.sizes.insert(created.client(), size);
+            }
+        }
+        created.map(|x| x as _)
     }
     fn destroyed(&self, _: wayland_client::backend::ObjectId) {}
 }
@@ -675,7 +870,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
             sids: HashMap::new(),
             cids: HashMap::new(),
             surfaces: HashMap::new(),
-            buffers: HashMap::new(),
+            sizes: HashMap::new(),
             viewporter: None,
             display,
             backend,
