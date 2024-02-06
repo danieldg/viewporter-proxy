@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     ffi::CString,
     future::{poll_fn, Future},
@@ -17,7 +17,7 @@ use tokio::io::unix::AsyncFd;
 use wayland_client::{
     backend::{
         protocol::{Argument as Arg, Interface, Message},
-        smallvec::smallvec,
+        smallvec::{smallvec, SmallVec},
         Backend, ObjectId, WaylandError,
     },
     globals::{registry_queue_init, GlobalList, GlobalListContents},
@@ -130,8 +130,15 @@ impl AsRawFd for Fd {
 #[derive(Debug)]
 struct Shared {
     server: AsyncFd<UnixStream>,
+    server_out: Mutex<VecDeque<OutMsg>>,
     backend: Backend,
     state: Mutex<State>,
+}
+
+#[derive(Debug)]
+struct OutMsg {
+    buf: Vec<u8>,
+    fds: Vec<OwnedFd>,
 }
 
 #[derive(Debug)]
@@ -884,10 +891,8 @@ impl Shared {
     ) -> Option<Arc<Object>> {
         use bytes::BufMut;
         let mut rv = None;
-        let mut ad_buf = [0; rustix::cmsg_space!(ScmRights(8))];
-        let mut ad = rustix::net::SendAncillaryBuffer::new(&mut ad_buf);
         let mut fds = Vec::new();
-        let mut buf = Vec::with_capacity(128);
+        let mut buf = Vec::with_capacity(32);
         buf.put_u32_le(sid);
         buf.put_u32_le(opcode as u32);
         for arg in args {
@@ -922,23 +927,79 @@ impl Shared {
                     buf.resize((buf.len() + 3) & !3, 0);
                 }
                 Arg::Fd(fd) => {
-                    fds.push(fd.as_fd());
+                    fds.push(fd.try_clone().unwrap());
                 }
             }
         }
         buf[6] = buf.len() as u8;
         buf[7] = (buf.len() >> 8) as u8;
-        if !fds.is_empty() {
-            ad.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
-        }
-        rustix::net::sendmsg(
-            &self.server,
-            &[rustix::io::IoSlice::new(&buf)],
-            &mut ad,
-            rustix::net::SendFlags::NOSIGNAL,
-        )
-        .unwrap();
+
+        self.server_out
+            .lock()
+            .unwrap()
+            .push_back(OutMsg { buf, fds });
         rv
+    }
+
+    fn try_write(&self) -> io::Result<bool> {
+        let mut queue = self.server_out.lock().unwrap();
+
+        let mut ad_buf = [0; rustix::cmsg_space!(ScmRights(8))];
+        while let Some(msg) = queue.front() {
+            let mut ad = rustix::net::SendAncillaryBuffer::new(&mut ad_buf);
+            let mut ios = SmallVec::<[_; 16]>::new();
+            let fds: Vec<_>;
+            if !msg.fds.is_empty() {
+                fds = msg.fds.iter().map(AsFd::as_fd).collect();
+                ad.push(rustix::net::SendAncillaryMessage::ScmRights(&fds));
+            }
+            ios.push(rustix::io::IoSlice::new(&msg.buf));
+
+            for msg in queue.iter().skip(1) {
+                if !msg.fds.is_empty() {
+                    break;
+                }
+                ios.push(rustix::io::IoSlice::new(&msg.buf));
+            }
+            let mut len = rustix::net::sendmsg(
+                &self.server,
+                &ios,
+                &mut ad,
+                rustix::net::SendFlags::NOSIGNAL,
+            )?;
+            if len == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            drop(ios);
+
+            while len > 0 {
+                let blen = queue[0].buf.len();
+                if len >= blen {
+                    queue.pop_front();
+                    len -= blen;
+                } else {
+                    queue[0].buf.drain(..len);
+                    queue[0].fds = Vec::new();
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn poll_server_out(&self, cx: &mut task::Context) -> io::Result<()> {
+        loop {
+            if let task::Poll::Ready(mut g) = self.server.poll_write_ready(cx)? {
+                match g.try_io(|_| self.try_write()) {
+                    Ok(Ok(true)) => return Ok(()),
+                    Ok(Ok(false)) => g.clear_ready(),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_block) => return Ok(()),
+                }
+            } else {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -993,6 +1054,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
 
     let shared = Arc::new_cyclic(|me| Shared {
         server,
+        server_out: Mutex::new(VecDeque::new()),
         backend: backend.clone(),
         state: Mutex::new(State {
             shared: me.clone(),
@@ -1080,7 +1142,10 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
         // task 3: client dispatch
         let _ = queue.poll_dispatch_pending(cx, &mut *shared.state.lock().unwrap())?;
 
-        // task 4: client write (blocking here will just exit)
+        // task 4: server write
+        shared.poll_server_out(cx)?;
+
+        // task 5: client write (blocking here will just exit)
         queue.flush()?;
         task::Poll::Pending
     })
