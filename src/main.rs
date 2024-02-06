@@ -14,11 +14,19 @@ use std::{
     task,
 };
 use tokio::io::unix::AsyncFd;
-use wayland_client::protocol::{
-    wl_compositor, wl_data_device, wl_data_device_manager, wl_display, wl_output, wl_pointer,
-    wl_registry, wl_seat, wl_shm, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
+use wayland_client::{
+    backend::{
+        protocol::{Argument as Arg, Interface, Message},
+        smallvec::smallvec,
+        Backend, ObjectId, WaylandError,
+    },
+    globals::{registry_queue_init, GlobalList, GlobalListContents},
+    protocol::{
+        wl_compositor, wl_data_device, wl_data_device_manager, wl_display, wl_output, wl_pointer,
+        wl_registry, wl_seat, wl_shm, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
+    },
+    Connection, Dispatch, Proxy, QueueHandle,
 };
-use wayland_client::{Connection, Dispatch, Proxy};
 use wayland_protocols::{
     wp::{
         cursor_shape::v1::client::wp_cursor_shape_manager_v1,
@@ -36,6 +44,7 @@ use wayland_protocols::{
 };
 
 fn scale_req_i32(x: i32) -> i32 {
+    // Some clients use regions with i32::MAX as the width or max, which would overflow if scaled
     if x > i32::MAX / 3 {
         x
     } else {
@@ -43,8 +52,7 @@ fn scale_req_i32(x: i32) -> i32 {
     }
 }
 
-fn scale_req_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, F>) {
-    use wayland_client::backend::protocol::Argument as Arg;
+fn scale_req_arg<I, F>(arg: &mut Arg<I, F>) {
     match arg {
         Arg::Int(x) => *x = scale_req_i32(*x),
         Arg::Uint(x) => *x = (*x * 3) / 2,
@@ -53,8 +61,7 @@ fn scale_req_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, 
     }
 }
 
-fn scale_evt_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, F>) {
-    use wayland_client::backend::protocol::Argument as Arg;
+fn scale_evt_arg<I, F>(arg: &mut Arg<I, F>) {
     match arg {
         Arg::Int(i) => *i = (*i * 2 + 1) / 3,
         Arg::Uint(i) => *i = (*i * 2 + 1) / 3,
@@ -63,7 +70,7 @@ fn scale_evt_arg<I, F>(arg: &mut wayland_client::backend::protocol::Argument<I, 
     }
 }
 
-fn lookup_interface(name: &[u8]) -> Option<&'static wayland_client::backend::protocol::Interface> {
+fn lookup_interface(name: &[u8]) -> Option<&'static Interface> {
     Some(match name {
         //  b"ext_idle_notifier_v1"
         //  b"org_kde_kwin_server_decoration_manager"
@@ -123,7 +130,7 @@ impl AsRawFd for Fd {
 #[derive(Debug)]
 struct Shared {
     server: AsyncFd<UnixStream>,
-    backend: wayland_client::backend::Backend,
+    backend: Backend,
     state: Mutex<State>,
 }
 
@@ -132,14 +139,14 @@ struct State {
     shared: Weak<Shared>,
     display: wl_display::WlDisplay,
     _display_obj: Option<Arc<Object>>,
-    backend: wayland_client::backend::Backend,
-    globals: wayland_client::globals::GlobalList,
+    backend: Backend,
+    globals: GlobalList,
     viewporter: Option<Arc<Object>>,
     registries: Vec<Arc<Object>>,
     sids: HashMap<u32, Weak<Object>>,
-    cids: HashMap<wayland_client::backend::ObjectId, Weak<Object>>,
-    surfaces: HashMap<wayland_client::backend::ObjectId, SurfaceData>,
-    sizes: HashMap<wayland_client::backend::ObjectId, (i32, i32)>,
+    cids: HashMap<ObjectId, Weak<Object>>,
+    surfaces: HashMap<ObjectId, SurfaceData>,
+    sizes: HashMap<ObjectId, (i32, i32)>,
 }
 
 #[derive(Debug)]
@@ -149,7 +156,7 @@ struct SurfaceData {
 }
 
 impl State {
-    fn cid(&self, cid: &wayland_client::backend::ObjectId) -> Option<Arc<Object>> {
+    fn cid(&self, cid: &ObjectId) -> Option<Arc<Object>> {
         self.cids.get(cid).and_then(Weak::upgrade)
     }
     fn sid(&self, sid: u32) -> Option<Arc<Object>> {
@@ -160,10 +167,10 @@ impl State {
 #[derive(Debug)]
 struct Object {
     shared: Weak<Shared>,
-    client: Mutex<wayland_client::backend::ObjectId>,
+    client: Mutex<ObjectId>,
     server: AtomicU32,
     hook: AtomicU32,
-    iface: &'static wayland_client::backend::protocol::Interface,
+    iface: &'static Interface,
 }
 
 impl Object {
@@ -177,18 +184,11 @@ impl Object {
         })
     }
 
-    fn new_hidden(
-        shared: &Arc<Shared>,
-        iface: &'static wayland_client::backend::protocol::Interface,
-    ) -> Arc<Self> {
+    fn new_hidden(shared: &Arc<Shared>, iface: &'static Interface) -> Arc<Self> {
         Self::new_request_created(shared, 0, iface)
     }
 
-    fn new_request_bind(
-        shared: &Arc<Shared>,
-        server: u32,
-        iface: &'static wayland_client::backend::protocol::Interface,
-    ) -> Arc<Self> {
+    fn new_request_bind(shared: &Arc<Shared>, server: u32, iface: &'static Interface) -> Arc<Self> {
         let rv = Self::new_request_created(shared, server, iface);
         let hook = match iface.name {
             "wl_compositor" => HOOK_COMPOSITOR,
@@ -210,18 +210,18 @@ impl Object {
     fn new_request_created(
         shared: &Arc<Shared>,
         server: u32,
-        iface: &'static wayland_client::backend::protocol::Interface,
+        iface: &'static Interface,
     ) -> Arc<Self> {
         Arc::new(Object {
             shared: Arc::downgrade(shared),
-            client: Mutex::new(wayland_client::backend::ObjectId::null()),
+            client: Mutex::new(ObjectId::null()),
             server: AtomicU32::new(server),
             hook: AtomicU32::new(HOOK_NONE),
             iface,
         })
     }
 
-    fn new_event_created(shared: &Arc<Shared>, id: wayland_client::backend::ObjectId) -> Arc<Self> {
+    fn new_event_created(shared: &Arc<Shared>, id: ObjectId) -> Arc<Self> {
         // we don't currently support intercepting or generating server-created objects, so just
         // enforce a 1:1 ID mapping for them.
         Arc::new(Object {
@@ -241,7 +241,7 @@ impl Object {
         sid
     }
 
-    fn client(&self) -> wayland_client::backend::ObjectId {
+    fn client(&self) -> ObjectId {
         self.client.lock().unwrap().clone()
     }
 
@@ -252,13 +252,9 @@ impl Object {
     fn intercept_request(
         &self,
         state: &mut State,
-        msg: &mut wayland_client::backend::protocol::Message<
-            wayland_client::backend::ObjectId,
-            i32,
-        >,
+        msg: &mut Message<ObjectId, i32>,
         newid: &mut Option<Arc<Object>>,
     ) -> (bool, Option<(Arc<Object>, Option<(i32, i32)>)>) {
-        use wayland_client::backend::protocol::Argument as Arg;
         fn hook_newid(newid: &mut Option<Arc<Object>>, hook: u32) {
             if let Some(id) = newid {
                 id.hook.store(hook, Ordering::Relaxed);
@@ -293,13 +289,15 @@ impl Object {
                         let (x, y) = size.cloned().map_or((-1, -1), |(x, y)| {
                             (scale_req_i32(x / scale), scale_req_i32(y / scale))
                         });
+
+                        // we should really avoid sending this if the buffer size is unchanged
                         state
                             .backend
                             .send_request(
-                                wayland_client::backend::protocol::Message {
+                                Message {
                                     sender_id: viewport,
                                     opcode: wp_viewport::REQ_SET_DESTINATION_OPCODE,
-                                    args: [Arg::Int(x), Arg::Int(y)].into_iter().collect(),
+                                    args: smallvec![Arg::Int(x), Arg::Int(y)],
                                 },
                                 None,
                                 None,
@@ -334,6 +332,7 @@ impl Object {
                         Arg::Object(s) => state.surfaces.get(&s).unwrap(),
                         _ => panic!(),
                     };
+                    // intercept and substitute the existing viewporter
                     let new_sid = newid.take().unwrap().take_server();
                     surface.viewport.server.store(new_sid, Ordering::Relaxed);
                     *newid = Some(surface.viewport.clone());
@@ -343,16 +342,18 @@ impl Object {
             HOOK_VIEWPORT => match msg.opcode {
                 wp_viewport::REQ_DESTROY_OPCODE => {
                     self.server.store(0, Ordering::Relaxed);
+                    // this is not complete: we should probably be sending a set-destination too
+                    // (with corrected sizes that must be looked up from the buffer), and also only
+                    // send the set_source if it's needed.  However, the problem is only present
+                    // for a single frame, if that (the next attach will correct it).
 
                     msg.opcode = wp_viewport::REQ_SET_SOURCE_OPCODE;
-                    msg.args = [
+                    msg.args = smallvec![
                         Arg::Fixed(-256),
                         Arg::Fixed(-256),
                         Arg::Fixed(-256),
                         Arg::Fixed(-256),
-                    ]
-                    .into_iter()
-                    .collect();
+                    ];
 
                     state.sizes.remove(&self.client());
                     return (true, None);
@@ -459,8 +460,6 @@ impl Object {
     }
 
     fn intercept_request_post(&self, state: &mut State, data: (Arc<Object>, Option<(i32, i32)>)) {
-        use wayland_client::backend::protocol::Argument as Arg;
-
         match data {
             (surface, None) => {
                 let surface_cid = surface.client();
@@ -469,20 +468,18 @@ impl Object {
                     server: AtomicU32::new(0),
                     hook: AtomicU32::new(HOOK_VIEWPORT),
                     iface: wp_viewport::WpViewport::interface(),
-                    client: Mutex::new(wayland_client::backend::ObjectId::null()),
+                    client: Mutex::new(ObjectId::null()),
                 });
                 let viewport_cid = state
                     .backend
                     .send_request(
-                        wayland_client::backend::protocol::Message {
+                        Message {
                             sender_id: state.viewporter.as_ref().unwrap().client(),
                             opcode: wp_viewporter::REQ_GET_VIEWPORT_OPCODE,
-                            args: [
-                                Arg::NewId(wayland_client::backend::ObjectId::null()),
+                            args: smallvec![
+                                Arg::NewId(ObjectId::null()),
                                 Arg::Object(surface_cid.clone()),
-                            ]
-                            .into_iter()
-                            .collect(),
+                            ],
                         },
                         Some(viewport.clone()),
                         None,
@@ -550,11 +547,8 @@ pseudo_enum! {
 impl wayland_client::backend::ObjectData for Object {
     fn event(
         self: Arc<Self>,
-        _: &wayland_client::backend::Backend,
-        mut msg: wayland_client::backend::protocol::Message<
-            wayland_client::backend::ObjectId,
-            OwnedFd,
-        >,
+        _: &Backend,
+        mut msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<(dyn wayland_client::backend::ObjectData + 'static)>> {
         let shared = self.shared.upgrade()?;
         let sid = self.server();
@@ -585,7 +579,7 @@ impl wayland_client::backend::ObjectData for Object {
             HOOK_DMABUF_PARAMS => {}
             HOOK_OUTPUT => match msg.opcode {
                 wl_output::EVT_SCALE_OPCODE => {
-                    msg.args[0] = wayland_client::backend::protocol::Argument::Int(2);
+                    msg.args[0] = Arg::Int(2);
                 }
                 _ => {}
             },
@@ -622,12 +616,12 @@ impl wayland_client::backend::ObjectData for Object {
             }
             HOOK_DATA_DEVICE => match msg.opcode {
                 wl_data_device::EVT_ENTER_OPCODE => {
-                    scale_req_arg(&mut msg.args[2]);
-                    scale_req_arg(&mut msg.args[3]);
+                    scale_evt_arg(&mut msg.args[2]);
+                    scale_evt_arg(&mut msg.args[3]);
                 }
                 wl_data_device::EVT_MOTION_OPCODE => {
-                    scale_req_arg(&mut msg.args[1]);
-                    scale_req_arg(&mut msg.args[2]);
+                    scale_evt_arg(&mut msg.args[1]);
+                    scale_evt_arg(&mut msg.args[2]);
                 }
                 _ => {}
             },
@@ -648,7 +642,7 @@ impl wayland_client::backend::ObjectData for Object {
         created.map(|x| x as _)
     }
 
-    fn destroyed(&self, _: wayland_client::backend::ObjectId) {
+    fn destroyed(&self, _: ObjectId) {
         // Note: this function is called from send_request if it sends a destructor, not when the
         // server actually calls delete_id.  It is therefore useless.
     }
@@ -656,7 +650,6 @@ impl wayland_client::backend::ObjectData for Object {
 
 impl Drop for Object {
     fn drop(&mut self) {
-        use wayland_client::backend::protocol::Argument as Arg;
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
@@ -687,7 +680,7 @@ impl Drop for Object {
 }
 
 impl Shared {
-    async fn server_parse(self: Arc<Self>) -> Result<(), Box<dyn Error>> {
+    async fn server_parse(self: Arc<Self>) -> io::Result<()> {
         let mut buf = [0; 4096];
         let mut ad_buf = [0; rustix::cmsg_space!(ScmRights(32))];
         let mut b_start = 0;
@@ -745,7 +738,6 @@ impl Shared {
 
     fn server_in(self: &Arc<Self>, mut buf: &[u8], fds: &mut Vec<OwnedFd>) {
         use bytes::Buf;
-        use wayland_client::backend::protocol::Argument as Arg;
         use wayland_client::backend::protocol::ArgumentType as ArgT;
         let sender_sid = buf.get_u32_le();
         let opcode = buf.get_u16_le();
@@ -756,7 +748,7 @@ impl Shared {
         };
         let mut fd_count = 0;
 
-        let mut msg = wayland_client::backend::protocol::Message {
+        let mut msg = Message {
             sender_id: sender.client(),
             opcode,
             args: Default::default(),
@@ -785,18 +777,14 @@ impl Shared {
                 }
                 ArgT::Object(_) => {
                     let sid = buf.get_u32_le();
-                    Arg::Object(
-                        state
-                            .sid(sid)
-                            .map_or(wayland_client::backend::ObjectId::null(), |o| o.client()),
-                    )
+                    Arg::Object(state.sid(sid).map_or(ObjectId::null(), |o| o.client()))
                 }
                 ArgT::NewId => {
                     new_sid = buf.get_u32_le();
                     newid_data = desc
                         .child_interface
                         .map(|i| Object::new_request_created(self, new_sid, i));
-                    Arg::NewId(wayland_client::backend::ObjectId::null())
+                    Arg::NewId(ObjectId::null())
                 }
                 ArgT::Array => {
                     let len = buf.get_u32_le() as usize;
@@ -873,7 +861,6 @@ impl Shared {
     }
 
     fn send_global(self: &Arc<Self>, sid: u32, name: u32, interface: &str, version: u32) {
-        use wayland_client::backend::protocol::Argument as Arg;
         let Some(iface) = lookup_interface(interface.as_bytes()) else {
             return;
         };
@@ -893,13 +880,9 @@ impl Shared {
         self: &Arc<Self>,
         sid: u32,
         opcode: u16,
-        args: &[wayland_client::backend::protocol::Argument<
-            wayland_client::backend::ObjectId,
-            OwnedFd,
-        >],
+        args: &[Arg<ObjectId, OwnedFd>],
     ) -> Option<Arc<Object>> {
         use bytes::BufMut;
-        use wayland_client::backend::protocol::Argument as Arg;
         let mut rv = None;
         let mut ad_buf = [0; rustix::cmsg_space!(ScmRights(8))];
         let mut ad = rustix::net::SendAncillaryBuffer::new(&mut ad_buf);
@@ -959,14 +942,14 @@ impl Shared {
     }
 }
 
-impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for State {
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
         state: &mut State,
         _: &wl_registry::WlRegistry,
         event: wl_registry::Event,
-        _: &wayland_client::globals::GlobalListContents,
+        _: &GlobalListContents,
         _: &Connection,
-        _: &wayland_client::QueueHandle<State>,
+        _: &QueueHandle<State>,
     ) {
         use wl_registry::Event;
         match event {
@@ -985,7 +968,6 @@ impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListConten
                 }
             }
             Event::GlobalRemove { name } => {
-                use wayland_client::backend::protocol::Argument as Arg;
                 for reg in &state.registries {
                     state.shared.upgrade().unwrap().server_out_raw(
                         reg.server(),
@@ -999,11 +981,11 @@ impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListConten
     }
 }
 
-async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
+async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
     let server = AsyncFd::new(server)?;
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
-    let (globals, mut queue) = wayland_client::globals::registry_queue_init(&conn)?;
+    let (globals, mut queue) = registry_queue_init(&conn)?;
     let backend = conn.backend();
     let mut c_reader = conn.prepare_read();
     let c_fd = c_reader.as_ref().unwrap().connection_fd().as_raw_fd();
@@ -1028,8 +1010,6 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
     });
 
     if let Ok(state) = shared.state.lock().as_deref_mut() {
-        use wayland_client::backend::protocol::Argument as Arg;
-
         let obj = Object::new(&shared, &state.display, 1);
         state.sids.insert(1, Arc::downgrade(&obj));
         state.cids.insert(state.display.id(), Arc::downgrade(&obj));
@@ -1043,19 +1023,17 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
                     let viewporter_cid = shared
                         .backend
                         .send_request(
-                            wayland_client::backend::protocol::Message {
+                            Message {
                                 sender_id: state.globals.registry().id(),
                                 opcode: wl_registry::REQ_BIND_OPCODE,
-                                args: [
+                                args: smallvec![
                                     Arg::Uint(global.name),
                                     Arg::Str(Some(Box::new(
                                         CString::new("wp_viewporter").unwrap(),
                                     ))),
                                     Arg::Uint(global.version),
-                                    Arg::NewId(wayland_client::backend::ObjectId::null()),
-                                ]
-                                .into_iter()
-                                .collect(),
+                                    Arg::NewId(ObjectId::null()),
+                                ],
                             },
                             Some(viewporter.clone()),
                             Some((wp_viewporter::WpViewporter::interface(), global.version)),
@@ -1071,11 +1049,12 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
 
     let mut parse = pin!(shared.clone().server_parse());
 
+    // An open-coded version of join so that we always call flush() after any write
     poll_fn(|cx| {
+        // task 1: client read
         loop {
             let c_read = c_fd.poll_read_ready(cx)?;
             if let task::Poll::Ready(mut g) = c_read {
-                use wayland_client::backend::WaylandError;
                 if c_reader.is_none() {
                     c_reader = conn.prepare_read();
                 }
@@ -1087,16 +1066,21 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error>> {
                     Err(e) => Err(e)?,
                 }
             } else {
+                // we have a Pending for task 1
                 break;
             }
         }
 
+        // task 2: server read
         match parse.as_mut().poll(cx)? {
             task::Poll::Ready(()) => return task::Poll::Ready(Ok(())),
             task::Poll::Pending => {}
-        };
+        }
 
+        // task 3: client dispatch
         let _ = queue.poll_dispatch_pending(cx, &mut *shared.state.lock().unwrap())?;
+
+        // task 4: client write (blocking here will just exit)
         queue.flush()?;
         task::Poll::Pending
     })
@@ -1114,7 +1098,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         loop {
             let (stream, _) = listen.accept().await?;
 
-            tokio::task::spawn_local(run(stream.into_std()?));
+            tokio::spawn(run(stream.into_std()?));
         }
     })
 }
