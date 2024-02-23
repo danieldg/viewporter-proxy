@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{hash_map::Entry as HashMapEntry, HashMap, VecDeque},
     error::Error,
     ffi::CString,
     future::{poll_fn, Future},
@@ -60,6 +60,9 @@ fn scale_req_arg<I, F>(arg: &mut Arg<I, F>) {
         _ => panic!(),
     }
 }
+
+// req may round down by 0.5; on evt, add that back before rounding down again.  This means that
+// evt(req(x)) == x for all x, and evt(req(x)) = x ± 1
 
 fn scale_evt_arg<I, F>(arg: &mut Arg<I, F>) {
     match arg {
@@ -144,15 +147,17 @@ struct OutMsg {
 #[derive(Debug)]
 struct State {
     shared: Weak<Shared>,
-    display: wl_display::WlDisplay,
-    _display_obj: Option<Arc<Object>>,
     backend: Backend,
     globals: GlobalList,
-    viewporter: Option<Arc<Object>>,
+    _display: Option<Arc<Object>>,
     registries: Vec<Arc<Object>>,
+    viewporter: Option<Arc<Object>>,
     sids: HashMap<u32, Weak<Object>>,
     cids: HashMap<ObjectId, Weak<Object>>,
     surfaces: HashMap<ObjectId, SurfaceData>,
+    /// viewport -> client-set destination size, post-scale; (-1, -1) or missing if unset
+    /// buffer, buffer_params -> size of buffer, pre-scale
+    /// surface -> size of last attached buffer, pre-scale
     sizes: HashMap<ObjectId, (i32, i32)>,
 }
 
@@ -281,23 +286,33 @@ impl Object {
             },
             HOOK_SURFACE => match msg.opcode {
                 wl_surface::REQ_ATTACH_OPCODE => {
-                    let sd = state.surfaces.get(&self.client()).unwrap();
+                    let cid = self.client();
+                    let sd = state.surfaces.get(&cid).unwrap();
                     let viewport = sd.viewport.client();
                     let scale = sd.scale;
-                    let vp_size = state.sizes.get(&viewport);
 
-                    if !vp_size.is_some_and(|&(x, _)| x >= 0) {
+                    let Some((x, y)) = (match &msg.args[0] {
+                        Arg::Object(buffer) => state.sizes.get(buffer).cloned(),
+                        _ => panic!(),
+                    }) else {
+                        // Attaching a NULL buffer means we should not send any viewporter changes
+                        return (true, None);
+                    };
+
+                    let prev_size = state.sizes.insert(cid, (x, y));
+                    if Some((x, y)) == prev_size {
+                        // If the buffer didn't change size, we do nothing
+                        return (true, None);
+                    }
+
+                    let vp_size = state.sizes.get(&viewport).cloned();
+                    if !vp_size.is_some_and(|(x, _)| x > 0) {
                         // buffer size changes don't matter if the viewport is being used
-                        let size = match &msg.args[0] {
-                            Arg::Object(buffer) => state.sizes.get(buffer),
-                            _ => panic!(),
-                        };
-                        // buffer size is reduced by the declared scale
-                        let (x, y) = size.cloned().map_or((-1, -1), |(x, y)| {
-                            (scale_req_i32(x / scale), scale_req_i32(y / scale))
-                        });
 
-                        // we should really avoid sending this if the buffer size is unchanged
+                        // buffer size is reduced by the declared scale and then adjusted
+                        let x = scale_req_i32(x / scale);
+                        let y = scale_req_i32(y / scale);
+
                         state
                             .backend
                             .send_request(
@@ -318,6 +333,22 @@ impl Object {
                         _ => panic!(),
                     };
                     state.surfaces.get_mut(&self.client()).unwrap().scale = scale;
+                }
+                wl_surface::REQ_DESTROY_OPCODE => {
+                    let sd = state.surfaces.remove(&self.client()).unwrap();
+                    let viewport = sd.viewport.client();
+                    state
+                        .backend
+                        .send_request(
+                            Message {
+                                sender_id: viewport,
+                                opcode: wp_viewport::REQ_DESTROY_OPCODE,
+                                args: smallvec![],
+                            },
+                            None,
+                            None,
+                        )
+                        .unwrap();
                 }
                 _ => {}
             },
@@ -348,11 +379,19 @@ impl Object {
             }
             HOOK_VIEWPORT => match msg.opcode {
                 wp_viewport::REQ_DESTROY_OPCODE => {
+                    // Since we intercepted the creation, we must also intercept the deletion, and
+                    // do the server-side part of Object::drop now.
+                    let shared = self.shared.upgrade().unwrap();
+                    let sid = self.server();
+                    shared.server_out(1, wl_display::EVT_DELETE_ID_OPCODE, [Arg::Uint(sid)]);
+                    state.sids.remove(&sid);
                     self.server.store(0, Ordering::Relaxed);
+
                     // this is not complete: we should probably be sending a set-destination too
-                    // (with corrected sizes that must be looked up from the buffer), and also only
-                    // send the set_source if it's needed.  However, the problem is only present
-                    // for a single frame, if that (the next attach will correct it).
+                    // (with corrected sizes that are looked up from the surface), and also only
+                    // send the set_source if it's needed.  But clients generally don't destroy a
+                    // viewport object and keep using the surface with unchanged buffers (or at
+                    // all), so that's a lot of work for no gain.
 
                     msg.opcode = wp_viewport::REQ_SET_SOURCE_OPCODE;
                     msg.args = smallvec![
@@ -635,13 +674,13 @@ impl wayland_client::backend::ObjectData for Object {
             _ => unreachable!(),
         }
 
-        let created = shared.server_out_raw(sid, msg.opcode, &msg.args);
+        let created = shared.server_out(sid, msg.opcode, msg.args);
         if let Some(created) = &created {
             if self.hook.load(Ordering::Relaxed) == HOOK_DMABUF_PARAMS
                 && msg.opcode == zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE
             {
                 let shared = self.shared.upgrade().unwrap();
-                let mut state = shared.state.lock().unwrap();
+                let mut state = shared.state.try_lock().unwrap();
                 let size = state.sizes.remove(&self.client()).unwrap();
                 state.sizes.insert(created.client(), size);
             }
@@ -669,19 +708,19 @@ impl Drop for Object {
         }
         let mut state = shared.state.try_lock().expect("Missing use of HOOK_DEAD");
         state.cids.remove(&cid);
-        state.surfaces.remove(&cid);
         state.sizes.remove(&cid);
-        if let std::collections::hash_map::Entry::Occupied(e) = state.sids.entry(sid) {
+        if sid == 0 {
+            return;
+        }
+        if let HashMapEntry::Occupied(e) = state.sids.entry(sid) {
             if e.get().as_ptr() != self {
-                dbg!(sid); // early sid reuse or invalid object
+                // early sid reuse or invalid object
                 return;
             }
             e.remove();
             if sid < 0xff000000 {
-                shared.server_out_raw(1, wl_display::EVT_DELETE_ID_OPCODE, &[Arg::Uint(sid)]);
+                shared.server_out(1, wl_display::EVT_DELETE_ID_OPCODE, [Arg::Uint(sid)]);
             }
-        } else {
-            dbg!(sid);
         }
     }
 }
@@ -749,7 +788,7 @@ impl Shared {
         let sender_sid = buf.get_u32_le();
         let opcode = buf.get_u16_le();
         let _len = buf.get_u16_le();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.try_lock().unwrap();
         let Some(sender) = state.sid(sender_sid) else {
             return;
         };
@@ -825,7 +864,7 @@ impl Shared {
             assert_eq!(sender.hook.load(Ordering::Relaxed), HOOK_REGISTRY);
             // args: [numeric_name, interface_name, version, new_id]
             let iface = lookup_interface(match &msg.args[1] {
-                Arg::Str(Some(s)) => dbg!(s).as_bytes(),
+                Arg::Str(Some(s)) => s.as_bytes(),
                 _ => panic!(),
             })
             .unwrap();
@@ -852,7 +891,7 @@ impl Shared {
                 .send_request(msg, newid_data.clone().map(|x| x as _), child_spec)
                 .unwrap();
 
-            state = self.state.lock().unwrap();
+            state = self.state.try_lock().unwrap();
             if let Some(obj) = newid_data {
                 *obj.client.lock().unwrap() = oid.clone();
                 state.cids.insert(oid, Arc::downgrade(&obj));
@@ -872,10 +911,10 @@ impl Shared {
             return;
         };
         let version = version.min(iface.version);
-        self.server_out_raw(
+        self.server_out(
             sid,
             wl_registry::EVT_GLOBAL_OPCODE,
-            &[
+            [
                 Arg::Uint(name),
                 Arg::Str(Some(Box::new(CString::new(interface).unwrap()))),
                 Arg::Uint(version),
@@ -883,11 +922,11 @@ impl Shared {
         );
     }
 
-    fn server_out_raw(
+    fn server_out(
         self: &Arc<Self>,
         sid: u32,
         opcode: u16,
-        args: &[Arg<ObjectId, OwnedFd>],
+        args: impl IntoIterator<Item = Arg<ObjectId, OwnedFd>>,
     ) -> Option<Arc<Object>> {
         use bytes::BufMut;
         let mut rv = None;
@@ -897,9 +936,9 @@ impl Shared {
         buf.put_u32_le(opcode as u32);
         for arg in args {
             match arg {
-                Arg::Int(i) => buf.put_i32_le(*i),
-                Arg::Uint(i) => buf.put_u32_le(*i),
-                Arg::Fixed(i) => buf.put_i32_le(*i),
+                Arg::Int(i) => buf.put_i32_le(i),
+                Arg::Uint(i) => buf.put_u32_le(i),
+                Arg::Fixed(i) => buf.put_i32_le(i),
                 Arg::Str(None) => buf.put_u32_le(0),
                 Arg::Str(Some(s)) => {
                     let s = s.as_bytes_with_nul();
@@ -908,13 +947,13 @@ impl Shared {
                     buf.resize((buf.len() + 3) & !3, 0);
                 }
                 Arg::Object(cid) => {
-                    let state = self.state.lock().unwrap();
-                    let sid = state.cid(cid).map_or(0, |obj| obj.server());
+                    let state = self.state.try_lock().unwrap();
+                    let sid = state.cid(&cid).map_or(0, |obj| obj.server());
                     buf.put_u32_le(sid);
                 }
                 Arg::NewId(cid) => {
                     let sid = cid.protocol_id();
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.try_lock().unwrap();
                     let obj = Object::new_event_created(self, cid.clone());
                     state.cids.insert(cid.clone(), Arc::downgrade(&obj));
                     state.sids.insert(sid, Arc::downgrade(&obj));
@@ -923,12 +962,10 @@ impl Shared {
                 }
                 Arg::Array(s) => {
                     buf.put_u32_le(s.len() as _);
-                    buf.extend_from_slice(s);
+                    buf.extend_from_slice(&s);
                     buf.resize((buf.len() + 3) & !3, 0);
                 }
-                Arg::Fd(fd) => {
-                    fds.push(fd.try_clone().unwrap());
-                }
+                Arg::Fd(fd) => fds.push(fd),
             }
         }
         buf[6] = buf.len() as u8;
@@ -1030,10 +1067,10 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
             }
             Event::GlobalRemove { name } => {
                 for reg in &state.registries {
-                    state.shared.upgrade().unwrap().server_out_raw(
+                    state.shared.upgrade().unwrap().server_out(
                         reg.server(),
                         wl_registry::EVT_GLOBAL_REMOVE_OPCODE,
-                        &[Arg::Uint(name)],
+                        [Arg::Uint(name)],
                     );
                 }
             }
@@ -1046,6 +1083,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
     let server = AsyncFd::new(server)?;
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
+    // Note: this blocks for one compositor round-trip.  Not doing that is a lot more code.
     let (globals, mut queue) = registry_queue_init(&conn)?;
     let backend = conn.backend();
     let mut c_reader = conn.prepare_read();
@@ -1063,8 +1101,7 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
             surfaces: HashMap::new(),
             sizes: HashMap::new(),
             viewporter: None,
-            display,
-            _display_obj: None,
+            _display: None,
             backend,
             globals,
             registries: Vec::new(),
@@ -1072,10 +1109,10 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
     });
 
     if let Ok(state) = shared.state.lock().as_deref_mut() {
-        let obj = Object::new(&shared, &state.display, 1);
+        let obj = Object::new(&shared, &display, 1);
         state.sids.insert(1, Arc::downgrade(&obj));
-        state.cids.insert(state.display.id(), Arc::downgrade(&obj));
-        state._display_obj = Some(obj); // prevent delete_id of the display
+        state.cids.insert(display.id(), Arc::downgrade(&obj));
+        state._display = Some(obj); // prevent delete_id of the display
 
         state.globals.contents().with_list(|list| {
             for global in list {
@@ -1107,16 +1144,25 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
                 }
             }
         });
+
+        if state.viewporter.is_none() {
+            panic!("Compositor must support wp_viewporter!");
+        }
     }
 
     let mut parse = pin!(shared.clone().server_parse());
 
-    // An open-coded version of join so that we always call flush() after any write
+    // An open-coded version of join so that we don't need to explicitly wake the write-out tasks
+    // when they have data enqueued - since they are always polled after the reads (which are what
+    // would generate any writes), they will either flush buffers or (rarely) block on the write
+    // and set up a wake.
+    //
+    // The tokio AsyncFd readiness tracking will avoid attempting recvmsg on the non-ready socket,
+    // which is the only thing that could benefit from split tasks.
     poll_fn(|cx| {
         // task 1: client read
         loop {
-            let c_read = c_fd.poll_read_ready(cx)?;
-            if let task::Poll::Ready(mut g) = c_read {
+            if let task::Poll::Ready(mut g) = c_fd.poll_read_ready(cx)? {
                 if c_reader.is_none() {
                     c_reader = conn.prepare_read();
                 }
@@ -1133,20 +1179,35 @@ async fn run(server: UnixStream) -> Result<(), Box<dyn Error + Sync + Send>> {
             }
         }
 
-        // task 2: server read
+        // task 2: client dispatch
+        let _ = queue.poll_dispatch_pending(cx, &mut *shared.state.try_lock().unwrap())?;
+
+        // task 3: server read; this future ends on EOF, so we should also end.
         match parse.as_mut().poll(cx)? {
             task::Poll::Ready(()) => return task::Poll::Ready(Ok(())),
             task::Poll::Pending => {}
         }
 
-        // task 3: client dispatch
-        let _ = queue.poll_dispatch_pending(cx, &mut *shared.state.lock().unwrap())?;
-
         // task 4: server write
         shared.poll_server_out(cx)?;
 
-        // task 5: client write (blocking here will just exit)
-        queue.flush()?;
+        // task 5: client write
+        loop {
+            if let task::Poll::Ready(mut g) = c_fd.poll_write_ready(cx)? {
+                match queue.flush() {
+                    // flushed, no need to get notifications
+                    Ok(()) => break,
+                    Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                        g.clear_ready();
+                    }
+                    Err(e) => Err(e)?,
+                }
+            } else {
+                // we have a Pending for task 5
+                break;
+            }
+        }
+
         task::Poll::Pending
     })
     .await
@@ -1157,9 +1218,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()?;
 
+    let base = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+    let path = format!("{base}/wayland-vp");
+    let _ = std::fs::remove_file(&path);
+    println!("export WAYLAND_DISPLAY=wayland-vp");
+
     tokio::task::LocalSet::new().block_on(&rt, async move {
-        let _ = std::fs::remove_file("/run/user/1000/wayland-vp");
-        let listen = tokio::net::UnixListener::bind("/run/user/1000/wayland-vp")?;
+        let listen = tokio::net::UnixListener::bind(path)?;
         loop {
             let (stream, _) = listen.accept().await?;
 
